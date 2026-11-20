@@ -14,18 +14,23 @@ namespace Game
     public class HealthBarsLoader : ModLoader
     {
         // ---- ajustes: cambia estos numeros a tu gusto ----
-        const float Distancia = 24f;        // bloques; mas lejos no se dibuja
+        const float Distancia = 15f;        // bloques; mas lejos no se dibuja
         const float AnchoMinimo = 0.9f;     // ancho minimo de la barra (bloques)
         const float Alto = 0.11f;           // grosor de la barra
         const float Separacion = 0.35f;     // altura sobre la cabeza
-        const bool MostrarSiVidaLlena = false;
+        const bool MostrarSiVidaLlena = true; 
         const bool MostrarAlJugador = false;
+        const byte AlfaNormal = 128;        // 50% transparente
+        const float SegundosOpaca = 3f;     // tras un golpe, 100% visible este tiempo
         const bool MostrarNumeros = true;   // vida en numeros: 15/25
         const float TamanoTexto = 0.011f;   // tamano de los numeros
 
         static readonly PrimitivesRenderer3D renderizador = new PrimitivesRenderer3D();
         SubsystemCreatureSpawn creaturas;
         static BitmapFont fuente;
+        readonly Dictionary<ComponentCreature, float> vidaPrevia = new Dictionary<ComponentCreature, float>();
+        readonly Dictionary<ComponentCreature, double> ultimoGolpe = new Dictionary<ComponentCreature, double>();
+        double proximaLimpieza;
 
         public override void __ModInitialize()
         {
@@ -39,6 +44,8 @@ namespace Game
             List<SubsystemCreatureSpawn.CreatureType> creatureTypes)
         {
             creaturas = subsystemCreatureSpawn;
+            vidaPrevia.Clear();
+            ultimoGolpe.Clear();
         }
 
         public override void GuiDraw(ComponentGui componentGui, Camera camera, int drawOrder)
@@ -62,6 +69,16 @@ namespace Game
                     BlendState.AlphaBlend, SamplerState.LinearClamp);
             }
 
+            double ahora = Time.RealTime;
+            if (ahora > proximaLimpieza)
+            {
+                proximaLimpieza = ahora + 10.0;
+                List<ComponentCreature> quitar = new List<ComponentCreature>();
+                foreach (ComponentCreature k in vidaPrevia.Keys)
+                    if (k.ComponentHealth == null || k.ComponentHealth.Health <= 0f) quitar.Add(k);
+                foreach (ComponentCreature k in quitar) { vidaPrevia.Remove(k); ultimoGolpe.Remove(k); }
+            }
+
             bool algo = false;
             foreach (ComponentCreature c in creaturas.Creatures)
             {
@@ -70,6 +87,13 @@ namespace Game
                 if (vida <= 0f) continue;
                 if (!MostrarSiVidaLlena && vida >= 0.999f) continue;
                 if (!MostrarAlJugador && c.Entity.FindComponent<ComponentPlayer>(false) != null) continue;
+
+                float anterior;
+                if (vidaPrevia.TryGetValue(c, out anterior) && vida < anterior - 0.0001f) ultimoGolpe[c] = ahora;
+                vidaPrevia[c] = vida;
+                double golpe;
+                bool recienGolpeada = ultimoGolpe.TryGetValue(c, out golpe) && ahora - golpe < SegundosOpaca;
+                byte alfa = recienGolpeada ? (byte)255 : AlfaNormal;
 
                 ComponentBody cuerpo = c.ComponentBody;
                 Vector3 centro = cuerpo.Position + new Vector3(0f, cuerpo.BoxSize.Y + Separacion, 0f);
@@ -82,9 +106,9 @@ namespace Game
 
                 // fondo oscuro
                 Cuadro(lote, centro, derecha, arriba, -mitad - 0.02f, mitad + 0.02f, -h - 0.02f, h + 0.02f,
-                    new Color(0, 0, 0, 170));
+                    new Color((byte)0, (byte)0, (byte)0, (byte)(170 * alfa / 255)));
                 // relleno
-                Cuadro(lote, centro, derecha, arriba, -mitad, -mitad + ancho * v, -h, h, ColorVida(v));
+                Cuadro(lote, centro, derecha, arriba, -mitad, -mitad + ancho * v, -h, h, ColorVida(v, alfa));
                 if (texto != null)
                 {
                     float max = c.ComponentHealth.AttackResilience;
@@ -92,7 +116,7 @@ namespace Game
                         ? ((int)Math.Ceiling(v * max)).ToString() + "/" + ((int)Math.Round(max)).ToString()
                         : ((int)Math.Ceiling(v * 100f)).ToString() + "%";
                     texto.QueueText(etiqueta, centro + arriba * (h + 0.05f),
-                        derecha * TamanoTexto, -arriba * TamanoTexto, Color.White,
+                        derecha * TamanoTexto, -arriba * TamanoTexto, new Color((byte)255, (byte)255, (byte)255, alfa),
                         TextAnchor.HorizontalCenter | TextAnchor.Bottom);
                 }
                 algo = true;
@@ -111,12 +135,12 @@ namespace Game
             lote.QueueQuad(a, b, c, d, color);
         }
 
-        static Color ColorVida(float v)
+        static Color ColorVida(float v, byte alfa)
         {
             // 1 = verde, 0.5 = amarillo, 0 = rojo
             byte r = (byte)(255f * MathUtils.Clamp(2f - 2f * v, 0f, 1f));
             byte g = (byte)(255f * MathUtils.Clamp(2f * v, 0f, 1f));
-            return new Color(r, g, (byte)30, (byte)255);
+            return new Color(r, g, (byte)30, alfa);
         }
     }
 }
