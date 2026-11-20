@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using Engine;
 using Engine.Graphics;
+using Engine.Media;
 using GameEntitySystem;
 
 namespace Game
