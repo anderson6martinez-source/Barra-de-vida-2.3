@@ -14,16 +14,13 @@
     <Compile Include="HealthBars.cs" />
   </ItemGroup>
   <ItemGroup>
-    <Reference Include="Engine">
-      <HintPath>libs/Engine$(GameVer).dll</HintPath>
+    <Reference Include="libs/Engine$(GameVer).dll">
       <Private>false</Private>
     </Reference>
-    <Reference Include="EntitySystem">
-      <HintPath>libs/EntitySystem$(GameVer).dll</HintPath>
+    <Reference Include="libs/EntitySystem$(GameVer).dll">
       <Private>false</Private>
     </Reference>
-    <Reference Include="Survivalcraft">
-      <HintPath>libs/Survivalcraft$(GameVer).dll</HintPath>
+    <Reference Include="libs/Survivalcraft$(GameVer).dll">
       <Private>false</Private>
     </Reference>
   </ItemGroup>
