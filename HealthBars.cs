@@ -1,4 +1,4 @@
-// Barra de vida sobre la cabeza de las criaturas. Survivalcraft API 1.9.
+// Barra de vida sobre la cabeza de las criaturas. Survivalcraft API 1.5 (APIVersion 1.50, juego 2.3).
 // Un solo archivo (igual que Zombies.cs): se compila en el mismo dll o en uno propio.
 //  - Solo se muestra si la criatura tiene la vida por debajo del maximo.
 //  - Verde -> amarillo -> rojo segun la vida. Se oculta lejos y detras de bloques.
@@ -22,6 +22,7 @@ namespace Game
         const bool MostrarAlJugador = false;
         const byte AlfaNormal = 128;        // 50% transparente
         const float SegundosOpaca = 3f;     // tras un golpe, 100% visible este tiempo
+        const bool VerATravesDeBloques = true; // true: el agua y los bloques no tapan la barra
         const bool MostrarNumeros = true;   // vida en numeros: 15/25
         const float TamanoTexto = 0.011f;   // tamano de los numeros
 
@@ -48,9 +49,25 @@ namespace Game
             ultimoGolpe.Clear();
         }
 
+        static bool desactivado;
+
         public override void GuiDraw(ComponentGui componentGui, Camera camera, int drawOrder)
         {
-            if (creaturas == null || camera == null) return;
+            if (desactivado || creaturas == null || camera == null) return;
+            try
+            {
+                Dibujar(camera);
+            }
+            catch (Exception e)
+            {
+                // si algo falla, el mod se apaga solo en vez de dejar la pantalla en negro
+                desactivado = true;
+                Log.Warning("BarraVida desactivada por error: " + e);
+            }
+        }
+
+        void Dibujar(Camera camera)
+        {
 
             Matrix vista = camera.ViewMatrix;
             Vector3 derecha = new Vector3(vista.M11, vista.M21, vista.M31);
@@ -58,14 +75,14 @@ namespace Game
             Vector3 ojo = camera.ViewPosition;
 
             FlatBatch3D lote = renderizador.FlatBatch(
-                100, DepthStencilState.DepthRead, RasterizerState.CullNone, BlendState.AlphaBlend);
+                100, (VerATravesDeBloques ? DepthStencilState.None : DepthStencilState.DepthRead), RasterizerState.CullNone, BlendState.AlphaBlend);
 
             FontBatch3D texto = null;
             if (MostrarNumeros)
             {
                 if (fuente == null) fuente = ContentManager.Get<BitmapFont>("Fonts/Pericles");
                 texto = renderizador.FontBatch(
-                    fuente, 101, DepthStencilState.DepthRead, RasterizerState.CullNone,
+                    fuente, 101, (VerATravesDeBloques ? DepthStencilState.None : DepthStencilState.DepthRead), RasterizerState.CullNone,
                     BlendState.AlphaBlend, SamplerState.LinearClamp);
             }
 
@@ -141,6 +158,315 @@ namespace Game
             byte r = (byte)(255f * MathUtils.Clamp(2f - 2f * v, 0f, 1f));
             byte g = (byte)(255f * MathUtils.Clamp(2f * v, 0f, 1f));
             return new Color(r, g, (byte)30, alfa);
+        }
+    }
+
+    // Boton "Correr": un boton en la pantalla (lado derecho) que alterna correr.
+    //  - Correr = velocidad x1.7 y gasto de stamina x1.7 (solo el movimiento; el salto gasta igual).
+    //  - Barra de stamina encima de los corazones y el hambre.
+    //  - Boton "Buff": cada golpe cuerpo a cuerpo hace +3 de dano y gasta 10% de stamina.
+    public class CorrerLoader : ModLoader
+    {
+        // ---- ajustes ----
+        const float Multiplicador = 1.7f;          // velocidad al correr (1.7 = 70% mas rapido)
+        const float MultiplicadorStamina = 1.7f;   // gasto de stamina al correr (1.7 = 70% mas)
+        const string TextoApagado = "Correr";
+        const string TextoEncendido = "Correr: ON";
+        const bool MostrarBarraStamina = true;
+        const float SeparacionBoton = 6f;          // espacio entre botones
+        const float AltoBoton = 48f;
+        // ---- buff de dano ----
+        const string TextoBuffApagado = "Buff";
+        const string TextoBuffEncendido = "Buff: ON";
+        const float BonusDanio = 3f;               // dano extra por golpe con el buff activo
+        const float CostoStaminaGolpe = 0.10f;     // stamina que gasta cada golpe (0.10 = 10%)
+        const float AltoBarra = 6f;                // grosor de la barra de stamina
+        const float SeparacionBarra = 4f;          // espacio entre la barra y los corazones
+        const float AnchoMinimoBarra = 80f;        // ancho minimo de la barra
+
+        class Estado
+        {
+            public StackPanelWidget Panel;
+            public BevelledButtonWidget Boton;
+            public bool Corriendo;
+            public float VelocidadBase;
+            public double UltimoToque;
+            public BevelledButtonWidget BotonBuff;
+            public bool Buff;
+            public double UltimoToqueBuff;
+            public double UltimoAviso;
+            public CanvasWidget Caja;
+            public RectangleWidget Fondo;
+            public RectangleWidget Relleno;
+        }
+
+        readonly Dictionary<ComponentGui, Estado> estados = new Dictionary<ComponentGui, Estado>();
+        SubsystemTime tiempo;
+        static bool desactivado;
+
+        public override void __ModInitialize()
+        {
+            ModsManager.RegisterHook("InitializeCreatureTypes", this);
+            ModsManager.RegisterHook("GuiDraw", this);
+            ModsManager.RegisterHook("GuiUpdate", this);
+            ModsManager.RegisterHook("AttackBody", this);
+        }
+
+        public override void InitializeCreatureTypes(
+            SubsystemCreatureSpawn subsystemCreatureSpawn,
+            List<SubsystemCreatureSpawn.CreatureType> creatureTypes)
+        {
+            estados.Clear(); // mundo nuevo: se crean botones y barras nuevos
+            tiempo = null;
+        }
+
+        // el juego gasta la stamina en ComponentVitalStats.UpdateStamina; aqui solo se resta el EXTRA
+        // del movimiento (el salto no se toca), con las mismas formulas del juego
+        public override void GuiUpdate(ComponentGui componentGui)
+        {
+            if (desactivado || componentGui == null) return;
+            try
+            {
+                Estado e;
+                if (!estados.TryGetValue(componentGui, out e) || !e.Corriendo) return;
+                ComponentPlayer jugador = componentGui.Entity.FindComponent<ComponentPlayer>(false);
+                if (jugador == null || !SupervivenciaActiva(jugador)) return;
+                if (tiempo == null) tiempo = componentGui.Project.FindSubsystem<SubsystemTime>(true);
+                float dt = tiempo.GameTimeDelta;
+                if (dt <= 0f) return;
+
+                ComponentVitalStats vital = jugador.ComponentVitalStats;
+                ComponentLocomotion loc = jugador.ComponentLocomotion;
+                ComponentBody cuerpo = jugador.ComponentBody;
+                if (vital == null || loc == null || cuerpo == null) return;
+
+                Vector2? orden = loc.LastWalkOrder;
+                float caminar = orden.HasValue ? orden.Value.Length() : 0f;
+                if (caminar <= 0f) return; // quieto: no hay gasto extra
+
+                float alturaOjos = jugador.ComponentCreatureModel.EyePosition.Y - cuerpo.Position.Y;
+                bool bajoAgua = cuerpo.ImmersionDepth > alturaOjos;
+                bool nadando = cuerpo.ImmersionFactor > 0.33f && !cuerpo.StandingOnValue.HasValue;
+
+                float k = 1f / MathUtils.Max(jugador.ComponentLevel.SpeedFactor, 0.75f);
+                if (jugador.ComponentSickness.IsSick || jugador.ComponentFlu.HasFlu) k *= 5f;
+
+                // parte del gasto del juego que depende del movimiento (por segundo)
+                float movimiento = (nadando || bajoAgua)
+                    ? 0.008f * caminar
+                    : (0.07f + 0.006f * k) * caminar;
+
+                vital.Stamina -= (MultiplicadorStamina - 1f) * movimiento * dt;
+            }
+            catch (Exception ex)
+            {
+                desactivado = true;
+                Log.Warning("BotonCorrer (stamina) desactivado por error: " + ex);
+            }
+        }
+
+        public override void GuiDraw(ComponentGui componentGui, Camera camera, int drawOrder)
+        {
+            if (desactivado || componentGui == null) return;
+            try
+            {
+                ComponentPlayer jugador = componentGui.Entity.FindComponent<ComponentPlayer>(false);
+                if (jugador == null || jugador.ComponentLocomotion == null) return;
+                if (componentGui.ControlsContainerWidget == null) return;
+
+                Estado e;
+                if (!estados.TryGetValue(componentGui, out e))
+                {
+                    e = new Estado();
+                    e.Panel = new StackPanelWidget();
+                    e.Panel.Direction = LayoutDirection.Vertical;
+                    e.Panel.HorizontalAlignment = WidgetAlignment.Far;
+                    e.Panel.VerticalAlignment = WidgetAlignment.Center;
+                    e.Panel.Margin = new Vector2(8f, 0f);
+
+                    e.Boton = new BevelledButtonWidget();
+                    e.Boton.Text = TextoApagado;
+                    e.Boton.Size = new Vector2(96f, AltoBoton);
+                    e.Boton.Margin = new Vector2(0f, SeparacionBoton * 0.5f);
+                    e.Panel.AddChildren(e.Boton);
+
+                    e.BotonBuff = new BevelledButtonWidget();
+                    e.BotonBuff.Text = TextoBuffApagado;
+                    e.BotonBuff.Size = new Vector2(96f, AltoBoton);
+                    e.BotonBuff.Margin = new Vector2(0f, SeparacionBoton * 0.5f);
+                    e.Panel.AddChildren(e.BotonBuff);
+
+                    componentGui.ControlsContainerWidget.AddChildren(e.Panel);
+
+                    if (MostrarBarraStamina)
+                    {
+                        e.Caja = new CanvasWidget();
+                        e.Caja.HorizontalAlignment = WidgetAlignment.Near;
+                        e.Caja.VerticalAlignment = WidgetAlignment.Near;
+                        e.Caja.IsHitTestVisible = false;
+                        e.Fondo = new RectangleWidget();
+                        e.Fondo.HorizontalAlignment = WidgetAlignment.Near;
+                        e.Fondo.VerticalAlignment = WidgetAlignment.Near;
+                        e.Fondo.FillColor = new Color((byte)0, (byte)0, (byte)0, (byte)150);
+                        e.Fondo.OutlineColor = new Color((byte)255, (byte)255, (byte)255, (byte)90);
+                        e.Fondo.OutlineThickness = 1f;
+                        e.Relleno = new RectangleWidget();
+                        e.Relleno.HorizontalAlignment = WidgetAlignment.Near;
+                        e.Relleno.VerticalAlignment = WidgetAlignment.Near;
+                        e.Relleno.OutlineColor = Color.Transparent;
+                        e.Caja.AddChildren(e.Fondo);
+                        e.Caja.AddChildren(e.Relleno);
+                        e.Caja.IsVisible = false;
+                        componentGui.ControlsContainerWidget.AddChildren(e.Caja);
+                    }
+                    estados[componentGui] = e;
+                }
+
+                ComponentLocomotion loc = jugador.ComponentLocomotion;
+                double ahora = Time.RealTime;
+                if (e.Boton.IsClicked && ahora - e.UltimoToque > 0.25)
+                {
+                    e.UltimoToque = ahora;
+                    e.Corriendo = !e.Corriendo;
+                    e.Boton.Text = e.Corriendo ? TextoEncendido : TextoApagado;
+                    if (e.Corriendo) e.VelocidadBase = loc.WalkSpeed;
+                    else loc.WalkSpeed = e.VelocidadBase;
+                }
+                if (e.Corriendo) loc.WalkSpeed = e.VelocidadBase * Multiplicador;
+
+                if (e.BotonBuff.IsClicked && ahora - e.UltimoToqueBuff > 0.25)
+                {
+                    e.UltimoToqueBuff = ahora;
+                    e.Buff = !e.Buff;
+                    e.BotonBuff.Text = e.Buff ? TextoBuffEncendido : TextoBuffApagado;
+                }
+
+                ColocarBoton(componentGui, e);
+                if (e.Caja != null) ActualizarBarra(componentGui, jugador, e);
+            }
+            catch (Exception ex)
+            {
+                desactivado = true;
+                Log.Warning("BotonCorrer desactivado por error: " + ex);
+            }
+        }
+
+        // busca el boton de agacharse (en cualquier parte de la pantalla del jugador)
+        static ButtonWidget BuscarAgachar(ComponentGui gui)
+        {
+            ButtonWidget b = null;
+            ContainerWidget contenedor = gui.ControlsContainerWidget;
+            ContainerWidget raiz = contenedor.RootWidget as ContainerWidget;
+            if (raiz != null) b = raiz.Children.Find<ButtonWidget>("SneakButton", false);
+            if (b == null) b = contenedor.Children.Find<ButtonWidget>("SneakButton", false);
+            return b;
+        }
+
+        // pone el panel (Correr + Buff) en la columna derecha, justo debajo del boton de agacharse
+        // (si no lo encuentra, se queda a media altura en el borde derecho)
+        void ColocarBoton(ComponentGui gui, Estado e)
+        {
+            ContainerWidget contenedor = gui.ControlsContainerWidget;
+            ButtonWidget agachar = BuscarAgachar(gui);
+            if (agachar == null || !agachar.IsVisibleGlobal) return;
+            float escala = contenedor.GlobalScale > 0.0001f ? contenedor.GlobalScale : 1f;
+            BoundingRectangle area = contenedor.GlobalBounds;
+            BoundingRectangle b = agachar.GlobalBounds;
+            e.Panel.HorizontalAlignment = WidgetAlignment.Far;
+            e.Panel.VerticalAlignment = WidgetAlignment.Near;
+            e.Panel.Margin = new Vector2(
+                MathUtils.Max((area.Max.X - b.Max.X) / escala, 0f),
+                (b.Max.Y - area.Min.Y) / escala + SeparacionBoton * 0.5f);
+        }
+
+        // buff: cada golpe cuerpo a cuerpo del jugador hace +BonusDanio y gasta CostoStaminaGolpe de stamina.
+        // sin stamina suficiente (en supervivencia) el golpe sale normal, sin bonus y sin gasto.
+        public override bool AttackBody(ComponentBody target, ComponentCreature attacker,
+            Vector3 hitPoint, Vector3 hitDirection, ref float attackPower, bool isMeleeAttack)
+        {
+            if (desactivado || attacker == null || !isMeleeAttack || attackPower <= 0f) return false;
+            try
+            {
+                ComponentPlayer jugador = attacker as ComponentPlayer;
+                if (jugador == null) return false;
+                ComponentGui gui = jugador.Entity.FindComponent<ComponentGui>(false);
+                Estado e;
+                if (gui == null || !estados.TryGetValue(gui, out e) || !e.Buff) return false;
+
+                ComponentVitalStats vital = jugador.ComponentVitalStats;
+                if (vital != null && SupervivenciaActiva(jugador))
+                {
+                    if (vital.Stamina < CostoStaminaGolpe)
+                    {
+                        double ahora = Time.RealTime;
+                        if (ahora - e.UltimoAviso > 2.0)
+                        {
+                            e.UltimoAviso = ahora;
+                            gui.DisplaySmallMessage("Sin stamina para el buff", Color.White, true, false);
+                        }
+                        return false;
+                    }
+                    vital.Stamina -= CostoStaminaGolpe;
+                }
+                attackPower += BonusDanio;
+            }
+            catch (Exception ex)
+            {
+                desactivado = true;
+                Log.Warning("Buff de dano desactivado por error: " + ex);
+            }
+            return false;
+        }
+
+        // la stamina solo se gasta en supervivencia (igual que el juego)
+        static bool SupervivenciaActiva(ComponentPlayer jugador)
+        {
+            SubsystemGameInfo info = jugador.Project.FindSubsystem<SubsystemGameInfo>(true);
+            return (int)info.WorldSettings.GameMode >= (int)GameMode.Survival
+                && info.WorldSettings.AreAdventureSurvivalMechanicsEnabled;
+        }
+
+        // pone la barra justo encima de los corazones y el hambre y la rellena segun la stamina
+        void ActualizarBarra(ComponentGui gui, ComponentPlayer jugador, Estado e)
+        {
+            ValueBarWidget vida = gui.HealthBarWidget;
+            ContainerWidget contenedor = gui.ControlsContainerWidget;
+            ComponentVitalStats vital = jugador.ComponentVitalStats;
+            bool mostrar = vida != null && vital != null && vida.IsVisibleGlobal && SupervivenciaActiva(jugador);
+            e.Caja.IsVisible = mostrar;
+            if (!mostrar) return;
+
+            // zona que ocupan los corazones (y el hambre, si se ve), en pixeles de pantalla
+            BoundingRectangle zona = vida.GlobalBounds;
+            ValueBarWidget comida = gui.FoodBarWidget;
+            if (comida != null && comida.IsVisibleGlobal)
+            {
+                BoundingRectangle c = comida.GlobalBounds;
+                zona = new BoundingRectangle(
+                    new Vector2(MathUtils.Min(zona.Min.X, c.Min.X), MathUtils.Min(zona.Min.Y, c.Min.Y)),
+                    new Vector2(MathUtils.Max(zona.Max.X, c.Max.X), MathUtils.Max(zona.Max.Y, c.Max.Y)));
+            }
+
+            float escala = contenedor.GlobalScale > 0.0001f ? contenedor.GlobalScale : 1f;
+            BoundingRectangle area = contenedor.GlobalBounds;
+            float ancho = MathUtils.Max((zona.Max.X - zona.Min.X) / escala, AnchoMinimoBarra);
+            float x = (zona.Min.X - area.Min.X) / escala;
+            float y = (zona.Min.Y - area.Min.Y) / escala - AltoBarra - SeparacionBarra;
+            if (y < 0f) y = 0f;
+
+            float v = MathUtils.Clamp(vital.Stamina, 0f, 1f);
+            e.Caja.Margin = new Vector2(x, y);
+            e.Caja.Size = new Vector2(ancho, AltoBarra);
+            e.Fondo.Size = new Vector2(ancho, AltoBarra);
+            e.Relleno.Size = new Vector2(ancho * v, AltoBarra);
+            e.Relleno.FillColor = ColorStamina(v);
+        }
+
+        static Color ColorStamina(float v)
+        {
+            if (v < 0.1f) return new Color((byte)220, (byte)60, (byte)50, (byte)255);    // casi agotada
+            if (v < 0.33f) return new Color((byte)240, (byte)150, (byte)40, (byte)255);  // cansado
+            return new Color((byte)80, (byte)190, (byte)255, (byte)255);                // normal
         }
     }
 }
