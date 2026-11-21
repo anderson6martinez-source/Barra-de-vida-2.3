@@ -53,7 +53,7 @@ namespace Game
 
         static bool desactivado;
 
-        public override void DrawToScreen(ViewWidget viewWidget, DrawContext dc)
+        public override void DrawToScreen(ViewWidget viewWidget, Widget.DrawContext dc)
         {
             if (desactivado || creaturas == null || viewWidget == null || viewWidget.GameWidget == null) return;
             Camera camera = viewWidget.GameWidget.ActiveCamera;
