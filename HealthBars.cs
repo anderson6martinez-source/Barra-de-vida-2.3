@@ -1,4 +1,4 @@
-// Barra de vida sobre la cabeza de las criaturas. Survivalcraft API 1.5 (APIVersion 1.50, juego 2.3).
+// Barra de vida sobre la cabeza de las criaturas. Survivalcraft API 1.9 (juego 2.4).
 // Un solo archivo (igual que Zombies.cs): se compila en el mismo dll o en uno propio.
 //  - Solo se muestra si la criatura tiene la vida por debajo del maximo.
 //  - Verde -> amarillo -> rojo segun la vida. Se oculta lejos y detras de bloques.
@@ -22,7 +22,7 @@ namespace Game
         const bool MostrarAlJugador = false;
         const byte AlfaNormal = 128;        // 50% transparente
         const float SegundosOpaca = 3f;     // tras un golpe, 100% visible este tiempo
-        const bool VerATravesDeBloques = true; // (sin uso: la barra siempre se ve encima de agua y bloques)
+        const bool VerATravesDeBloques = true; // true: el agua y los bloques no tapan la barra
         const bool MostrarNumeros = true;   // vida en numeros: 15/25
         const float TamanoTexto = 0.011f;   // tamano de los numeros
 
@@ -45,10 +45,11 @@ namespace Game
         {
             ModsManager.RegisterHook("InitializeCreatureTypes", this);
             ModsManager.RegisterHook("GuiDraw", this);
-            ModsManager.RegisterHook("AttackBody", this);
-            // GuiDraw corre ANTES que el agua y esta tapa la barra; DrawToScreen corre cuando el
-            // mundo (agua incluida) ya esta dibujado, asi que la barra queda encima de todo.
-            ModsManager.RegisterHook("DrawToScreen", this);
+            ModsManager.RegisterHook("ProcessAttackment", this);
+            // GuiDraw se dibuja en el orden 9, ANTES que el agua (orden 100) y esta tapa la barra.
+            // RenderModels se llama por cada orden de modelos (-10000, 1, 99, 201): usamos el
+            // ultimo (201), que va despues del agua.
+            ModsManager.RegisterHook("RenderModels", this);
         }
 
         // el juego llama a este hook una vez por cada mundo que se carga
@@ -69,6 +70,7 @@ namespace Game
         const float SegundosPanel = 10f;    // el panel dura 10 s tras el ultimo golpe a ese animal
         const float AnchoPanel = 200f;
         const float AltoPanel = 76f;
+        const float AltoPanelCampeon = 98f; // con la linea extra del color del campeon
         const float AltoBarraPanel = 7f;    // grosor de la barrita fina
 
         class Panel
@@ -77,6 +79,10 @@ namespace Game
             public LabelWidget Nombre;
             public LabelWidget Vida;
             public RectangleWidget Relleno;
+            public RectangleWidget Fondo;
+            public RectangleWidget FondoBarra;
+            public LabelWidget Campeon;
+            public int UltimoTipo = -2;
             public ComponentCreature Objetivo;
             public double Fin;
             public string UltimoTexto;
@@ -86,8 +92,54 @@ namespace Game
         static bool panelDesactivado;
         static System.Reflection.MemberInfo miembroObjetivo;
         static bool miembroBuscado;
-        double ultimoAtaqueJugador = -100;
-        ComponentCreature jugadorAtacante;
+
+        static readonly string[] NombresCampeon = { "Rojo", "Amarillo", "Verde", "Azul", "Morado", "Dorado", "Negro", "Blanco", "Naranja", "Jefe" };
+        static readonly Color[] ColoresCampeonUI =
+        {
+            new Color((byte)235, (byte)60, (byte)60, (byte)255),
+            new Color((byte)255, (byte)230, (byte)60, (byte)255),
+            new Color((byte)80, (byte)255, (byte)80, (byte)255),
+            new Color((byte)90, (byte)140, (byte)255, (byte)255),
+            new Color((byte)190, (byte)90, (byte)240, (byte)255),
+            new Color((byte)255, (byte)205, (byte)70, (byte)255),
+            new Color((byte)170, (byte)170, (byte)185, (byte)255),  // negro (gris claro para que se lea)
+            new Color((byte)235, (byte)245, (byte)255, (byte)255),  // blanco
+            new Color((byte)255, (byte)140, (byte)40, (byte)255),   // naranja
+            new Color((byte)255, (byte)90, (byte)90, (byte)255)     // jefe
+        };
+        static readonly List<System.Reflection.MethodInfo> metodosTipo = new List<System.Reflection.MethodInfo>();
+        static bool tipoBuscado;
+
+        // pregunta a Campeones.cs (criaturas) y a Zombies.cs (zombis) de que color es el campeon; -1 si no lo es
+        static int TipoCampeon(Entity e)
+        {
+            try
+            {
+                if (!tipoBuscado)
+                {
+                    tipoBuscado = true;
+                    string[] clases = { "GiganteCode.CampeonesLoader", "Game.ZombiesLoader" };
+                    foreach (System.Reflection.Assembly ens in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        foreach (string nombreCls in clases)
+                        {
+                            Type tipoCls = ens.GetType(nombreCls, false);
+                            if (tipoCls == null) continue;
+                            System.Reflection.MethodInfo m = tipoCls.GetMethod("TipoCampeon",
+                                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                            if (m != null) metodosTipo.Add(m);
+                        }
+                    }
+                }
+                for (int i = 0; i < metodosTipo.Count; i++)
+                {
+                    int r = (int)metodosTipo[i].Invoke(null, new object[] { e });
+                    if (r >= 0) return r;
+                }
+                return -1;
+            }
+            catch { return -1; }
+        }
 
         // saca la criatura golpeada del Attackment (el campo "Target" cambia de tipo segun la version)
         static ComponentCreature CriaturaDe(object ataque)
@@ -130,6 +182,7 @@ namespace Game
             p.Objetivo = objetivo;
             p.Fin = Time.RealTime + SegundosPanel;
             p.UltimoTexto = null;
+            p.UltimoTipo = -2;
         }
 
         public override void GuiDraw(ComponentGui componentGui, Camera camera, int drawOrder)
@@ -172,6 +225,7 @@ namespace Game
                     fondo.OutlineColor = new Color((byte)255, (byte)255, (byte)255, (byte)90);
                     fondo.OutlineThickness = 1f;
                     p.Caja.AddChildren(fondo);
+                    p.Fondo = fondo;
 
                     StackPanelWidget col = new StackPanelWidget();
                     col.Direction = LayoutDirection.Vertical;
@@ -186,6 +240,11 @@ namespace Game
                     p.Vida.FontScale = 1.0f;
                     p.Vida.HorizontalAlignment = WidgetAlignment.Center;
                     col.AddChildren(p.Nombre);
+                    p.Campeon = new LabelWidget();
+                    p.Campeon.FontScale = 0.8f;
+                    p.Campeon.HorizontalAlignment = WidgetAlignment.Center;
+                    p.Campeon.IsVisible = false;
+                    col.AddChildren(p.Campeon);
                     col.AddChildren(p.Vida);
                     p.Caja.AddChildren(col);
 
@@ -199,6 +258,7 @@ namespace Game
                     fondoBarra.FillColor = new Color((byte)40, (byte)40, (byte)40, (byte)200);
                     fondoBarra.OutlineColor = Color.Transparent;
                     p.Caja.AddChildren(fondoBarra);
+                    p.FondoBarra = fondoBarra;
                     p.Relleno = new RectangleWidget();
                     p.Relleno.Size = new Vector2(anchoBarra, AltoBarraPanel);
                     p.Relleno.HorizontalAlignment = WidgetAlignment.Near;
@@ -214,6 +274,31 @@ namespace Game
                     && Time.RealTime < p.Fin && !Durmiendo();
                 p.Caja.IsVisible = visible;
                 if (!visible) return;
+
+                // color del campeon (solo si existe Campeones.cs, juego 2.4)
+                int tipo = TipoCampeon(c.Entity);
+                if (tipo != p.UltimoTipo)
+                {
+                    p.UltimoTipo = tipo;
+                    bool esCampeon = tipo >= 0 && tipo < NombresCampeon.Length;
+                    float alto = esCampeon ? AltoPanelCampeon : AltoPanel;
+                    Color borde = new Color((byte)255, (byte)255, (byte)255, (byte)90);
+                    if (esCampeon)
+                    {
+                        Color cc = ColoresCampeonUI[tipo];
+                        p.Campeon.Text = "Campeon: " + NombresCampeon[tipo];
+                        p.Campeon.Color = cc;
+                        borde = cc;
+                    }
+                    p.Campeon.IsVisible = esCampeon;
+                    p.Caja.Size = new Vector2(AnchoPanel, alto);
+                    p.Fondo.Size = new Vector2(AnchoPanel, alto);
+                    p.Fondo.OutlineColor = borde;
+                    p.Fondo.OutlineThickness = esCampeon ? 2f : 1f;
+                    Vector2 mb = new Vector2(8f, alto - AltoBarraPanel - 8f);
+                    p.FondoBarra.Margin = mb;
+                    p.Relleno.Margin = mb;
+                }
 
                 float v = MathUtils.Clamp(c.ComponentHealth.Health, 0f, 1f);
                 float max = c.ComponentHealth.AttackResilience;
@@ -240,28 +325,30 @@ namespace Game
         }
 
         // el golpe del jugador a una criatura abre/renueva el panel lateral
-        public override bool AttackBody(ComponentBody target, ComponentCreature attacker,
-            Vector3 hitPoint, Vector3 hitDirection, ref float attackPower, bool isMeleeAttack)
+        public override void ProcessAttackment(Attackment attackment)
         {
+            if (attackment == null || attackment.Attacker == null) return;
             try
             {
-                if (attacker is ComponentPlayer) { jugadorAtacante = attacker; ultimoAtaqueJugador = Time.RealTime; }
-                RegistrarGolpe(attacker, CriaturaDe(target));
+                ComponentCreature atq = attackment.Attacker.FindComponent<ComponentCreature>(false);
+                RegistrarGolpe(atq, CriaturaDe((object)attackment));
             }
             catch (Exception ex)
             {
                 panelDesactivado = true;
                 Log.Warning("Panel de vida desactivado por error: " + ex);
             }
-            return false;
         }
 
 
-        public override void DrawToScreen(ViewWidget viewWidget, Widget.DrawContext dc)
+        public override void RenderModels(SubsystemModelsRenderer subsystemModelsRenderer, Camera camera,
+            int drawOrder, bool skippedByOtherMods, out bool skip)
         {
-            if (desactivado || creaturas == null || viewWidget == null || viewWidget.GameWidget == null) return;
-            Camera camera = viewWidget.GameWidget.ActiveCamera;
-            if (camera == null) return;
+            skip = false;
+            if (desactivado || creaturas == null || camera == null || subsystemModelsRenderer == null) return;
+            // solo en la ultima pasada de modelos (despues del agua)
+            int[] ordenes = subsystemModelsRenderer.DrawOrders;
+            if (ordenes == null || ordenes.Length == 0 || drawOrder != ordenes[ordenes.Length - 1]) return;
             try
             {
                 Dibujar(camera);
@@ -284,14 +371,14 @@ namespace Game
             Vector3 ojo = camera.ViewPosition;
 
             FlatBatch3D lote = renderizador.FlatBatch(
-                100, DepthStencilState.None, RasterizerState.CullNone, BlendState.AlphaBlend);
+                100, (VerATravesDeBloques ? DepthStencilState.None : DepthStencilState.DepthRead), RasterizerState.CullNone, BlendState.AlphaBlend);
 
             FontBatch3D texto = null;
             if (MostrarNumeros)
             {
                 if (fuente == null) fuente = ContentManager.Get<BitmapFont>("Fonts/Pericles");
                 texto = renderizador.FontBatch(
-                    fuente, 101, DepthStencilState.None, RasterizerState.CullNone,
+                    fuente, 101, (VerATravesDeBloques ? DepthStencilState.None : DepthStencilState.DepthRead), RasterizerState.CullNone,
                     BlendState.AlphaBlend, SamplerState.LinearClamp);
             }
 
@@ -318,8 +405,6 @@ namespace Game
                 if (vidaPrevia.TryGetValue(c, out anterior) && vida < anterior - 0.0001f)
                 {
                     ultimoGolpe[c] = ahora;
-                    if (ahora - ultimoAtaqueJugador < 1.0 && jugadorAtacante != null && !(c is ComponentPlayer))
-                        RegistrarGolpe(jugadorAtacante, c);
                 }
                 vidaPrevia[c] = vida;
                 double golpe;
@@ -398,6 +483,13 @@ namespace Game
         const float BonusMin = 1f;                 // dano extra minimo por golpe con el buff activo
         const float BonusMax = 3f;                 // dano extra maximo (sale al azar en pasos de 0.5: 1, 1.5, 2, 2.5, 3)
         static readonly System.Random azar = new System.Random();
+        // ---- esquive y golpe fuerte ----
+        const float CostoEsquive = 0.20f;          // stamina que gasta el esquive (0.20 = 20%)
+        const float ImpulsoEsquive = 8f;           // fuerza del salto hacia adelante
+        const double EsperaEsquive = 1.5;          // segundos entre esquives
+        const float CostoFuerte = 0.40f;           // stamina que gasta el golpe fuerte (0.40 = 40%)
+        const float MultiplicadorFuerte = 2f;      // el golpe fuerte hace x2 de dano
+        const float AltoBotonChico = 40f;
         const float CostoStaminaGolpe = 0.16f;     // stamina que gasta cada golpe (0.16 = 16%)
         const float AltoBarra = 6f;                // grosor de la barra de stamina
         const float SeparacionBarra = 4f;          // espacio entre la barra y los corazones
@@ -414,6 +506,12 @@ namespace Game
             public bool Buff;
             public double UltimoToqueBuff;
             public double UltimoAviso;
+            public BevelledButtonWidget BotonEsquive;
+            public BevelledButtonWidget BotonFuerte;
+            public bool Fuerte;
+            public double UltimoToqueEsquive;
+            public double UltimoToqueFuerte;
+            public double UltimoEsquive;
             public CanvasWidget Caja;
             public RectangleWidget Fondo;
             public RectangleWidget Relleno;
@@ -433,7 +531,8 @@ namespace Game
             ModsManager.RegisterHook("InitializeCreatureTypes", this);
             ModsManager.RegisterHook("GuiDraw", this);
             ModsManager.RegisterHook("GuiUpdate", this);
-            ModsManager.RegisterHook("AttackBody", this);
+            // en esta version del juego el golpe pasa por ProcessAttackment (el hook AttackBody ya no se llama)
+            ModsManager.RegisterHook("ProcessAttackment", this);
         }
 
         public override void InitializeCreatureTypes(
@@ -537,6 +636,18 @@ namespace Game
                     e.BotonBuff.Margin = new Vector2(0f, SeparacionBoton * 0.5f);
                     e.Panel.AddChildren(e.BotonBuff);
 
+                    e.BotonEsquive = new BevelledButtonWidget();
+                    e.BotonEsquive.Text = "Esquive";
+                    e.BotonEsquive.Size = new Vector2(96f, AltoBotonChico);
+                    e.BotonEsquive.Margin = new Vector2(0f, SeparacionBoton * 0.5f);
+                    e.Panel.AddChildren(e.BotonEsquive);
+
+                    e.BotonFuerte = new BevelledButtonWidget();
+                    e.BotonFuerte.Text = "Fuerte";
+                    e.BotonFuerte.Size = new Vector2(96f, AltoBotonChico);
+                    e.BotonFuerte.Margin = new Vector2(0f, SeparacionBoton * 0.5f);
+                    e.Panel.AddChildren(e.BotonFuerte);
+
                     e.Etiqueta = new LabelWidget();
                     e.Etiqueta.Text = "Stamina";
                     e.Etiqueta.HorizontalAlignment = WidgetAlignment.Center;
@@ -574,6 +685,18 @@ namespace Game
                     e.UltimoToqueBuff = ahora;
                     e.Buff = !e.Buff;
                     e.BotonBuff.Text = e.Buff ? TextoBuffEncendido : TextoBuffApagado;
+                }
+
+                if (e.BotonFuerte.IsClicked && ahora - e.UltimoToqueFuerte > 0.25)
+                {
+                    e.UltimoToqueFuerte = ahora;
+                    e.Fuerte = !e.Fuerte;
+                    e.BotonFuerte.Text = e.Fuerte ? "Fuerte: ON" : "Fuerte";
+                }
+                if (e.BotonEsquive.IsClicked && ahora - e.UltimoToqueEsquive > 0.25)
+                {
+                    e.UltimoToqueEsquive = ahora;
+                    Esquivar(componentGui, jugador, e, ahora);
                 }
 
                 // porcentaje de stamina en texto (el texto del juego siempre se refresca)
@@ -625,44 +748,91 @@ namespace Game
                 (b.Max.Y - area.Min.Y) / escala + SeparacionBoton * 0.5f);
         }
 
-        // buff: cada golpe cuerpo a cuerpo del jugador hace +BonusDanio y gasta CostoStaminaGolpe de stamina.
-        // sin stamina suficiente (en supervivencia) el golpe sale normal, sin bonus y sin gasto.
-        public override bool AttackBody(ComponentBody target, ComponentCreature attacker,
-            Vector3 hitPoint, Vector3 hitDirection, ref float attackPower, bool isMeleeAttack)
+        // esquive: salto rapido hacia adelante, gasta stamina y tiene espera
+        void Esquivar(ComponentGui gui, ComponentPlayer jugador, Estado e, double ahora)
         {
-            if (desactivado || attacker == null || !isMeleeAttack || attackPower <= 0f) return false;
+            if (ahora - e.UltimoEsquive < EsperaEsquive) return;
+            ComponentBody cuerpo = jugador.ComponentBody;
+            if (cuerpo == null) return;
+            ComponentVitalStats vital = jugador.ComponentVitalStats;
+            if (vital != null && SupervivenciaActiva(jugador))
+            {
+                if (vital.Stamina < CostoEsquive)
+                {
+                    gui.DisplaySmallMessage("Sin stamina para esquivar", Color.White, true, false);
+                    return;
+                }
+                vital.Stamina -= CostoEsquive;
+            }
+            Vector3 adelante = cuerpo.Matrix.Forward;
+            adelante.Y = 0f;
+            if (adelante.Length() < 0.01f) return;
+            adelante = Vector3.Normalize(adelante);
+            cuerpo.Velocity = cuerpo.Velocity + adelante * ImpulsoEsquive + new Vector3(0f, 1.5f, 0f);
+            e.UltimoEsquive = ahora;
+        }
+
+        // buff: cada golpe cuerpo a cuerpo del jugador hace +BonusDanio y gasta CostoStaminaGolpe de stamina.
+        // golpe fuerte: el siguiente golpe hace x2 de dano y gasta CostoFuerte (se apaga solo al usarlo).
+        // sin stamina suficiente (en supervivencia) el golpe sale normal, sin bonus y sin gasto.
+        public override void ProcessAttackment(Attackment attackment)
+        {
+            if (desactivado || attackment == null || !(attackment is MeleeAttackment) || attackment.AttackPower <= 0f) return;
             try
             {
-                ComponentPlayer jugador = attacker as ComponentPlayer;
-                if (jugador == null) return false;
+                if (attackment.Attacker == null) return;
+                ComponentPlayer jugador = attackment.Attacker.FindComponent<ComponentPlayer>(false);
+                if (jugador == null) return;
                 ComponentGui gui = jugador.Entity.FindComponent<ComponentGui>(false);
                 Estado e;
-                if (gui == null || !estados.TryGetValue(gui, out e) || !e.Buff) return false;
+                if (gui == null || !estados.TryGetValue(gui, out e) || (!e.Buff && !e.Fuerte)) return;
 
                 ComponentVitalStats vital = jugador.ComponentVitalStats;
-                if (vital != null && SupervivenciaActiva(jugador))
+                bool gasta = vital != null && SupervivenciaActiva(jugador);
+                double ahora = Time.RealTime;
+
+                if (e.Buff)
                 {
-                    if (vital.Stamina < CostoStaminaGolpe)
+                    if (gasta && vital.Stamina < CostoStaminaGolpe)
                     {
-                        double ahora = Time.RealTime;
                         if (ahora - e.UltimoAviso > 2.0)
                         {
                             e.UltimoAviso = ahora;
                             gui.DisplaySmallMessage("Sin stamina para el buff", Color.White, true, false);
                         }
-                        return false;
                     }
-                    vital.Stamina -= CostoStaminaGolpe;
+                    else
+                    {
+                        if (gasta) vital.Stamina -= CostoStaminaGolpe;
+                        int pasos = (int)Math.Round((BonusMax - BonusMin) / 0.5f);
+                        attackment.AttackPower += BonusMin + 0.5f * azar.Next(pasos + 1);
+                    }
                 }
-                int pasos = (int)Math.Round((BonusMax - BonusMin) / 0.5f);
-                attackPower += BonusMin + 0.5f * azar.Next(pasos + 1);
+
+                if (e.Fuerte)
+                {
+                    if (gasta && vital.Stamina < CostoFuerte)
+                    {
+                        if (ahora - e.UltimoAviso > 2.0)
+                        {
+                            e.UltimoAviso = ahora;
+                            gui.DisplaySmallMessage("Sin stamina para el golpe fuerte", Color.White, true, false);
+                        }
+                    }
+                    else
+                    {
+                        if (gasta) vital.Stamina -= CostoFuerte;
+                        attackment.AttackPower *= MultiplicadorFuerte;
+                        e.Fuerte = false; // se usa una sola vez
+                        e.BotonFuerte.Text = "Fuerte";
+                    }
+                }
             }
             catch (Exception ex)
             {
                 desactivado = true;
                 Log.Warning("Buff de dano desactivado por error: " + ex);
             }
-            return false;
         }
 
         // la stamina solo se gasta en supervivencia (igual que el juego)
