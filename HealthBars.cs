@@ -22,7 +22,7 @@ namespace Game
         const bool MostrarAlJugador = false;
         const byte AlfaNormal = 128;        // 50% transparente
         const float SegundosOpaca = 3f;     // tras un golpe, 100% visible este tiempo
-        const bool VerATravesDeBloques = true; // true: el agua y los bloques no tapan la barra
+        const bool VerATravesDeBloques = true; // (sin uso: la barra siempre se ve encima de agua y bloques)
         const bool MostrarNumeros = true;   // vida en numeros: 15/25
         const float TamanoTexto = 0.011f;   // tamano de los numeros
 
@@ -36,7 +36,9 @@ namespace Game
         public override void __ModInitialize()
         {
             ModsManager.RegisterHook("InitializeCreatureTypes", this);
-            ModsManager.RegisterHook("GuiDraw", this);
+            // GuiDraw corre ANTES que el agua y esta tapa la barra; DrawToScreen corre cuando el
+            // mundo (agua incluida) ya esta dibujado, asi que la barra queda encima de todo.
+            ModsManager.RegisterHook("DrawToScreen", this);
         }
 
         // el juego llama a este hook una vez por cada mundo que se carga
@@ -51,9 +53,11 @@ namespace Game
 
         static bool desactivado;
 
-        public override void GuiDraw(ComponentGui componentGui, Camera camera, int drawOrder)
+        public override void DrawToScreen(ViewWidget viewWidget, DrawContext dc)
         {
-            if (desactivado || creaturas == null || camera == null) return;
+            if (desactivado || creaturas == null || viewWidget == null || viewWidget.GameWidget == null) return;
+            Camera camera = viewWidget.GameWidget.ActiveCamera;
+            if (camera == null) return;
             try
             {
                 Dibujar(camera);
@@ -75,14 +79,14 @@ namespace Game
             Vector3 ojo = camera.ViewPosition;
 
             FlatBatch3D lote = renderizador.FlatBatch(
-                100, (VerATravesDeBloques ? DepthStencilState.None : DepthStencilState.DepthRead), RasterizerState.CullNone, BlendState.AlphaBlend);
+                100, DepthStencilState.None, RasterizerState.CullNone, BlendState.AlphaBlend);
 
             FontBatch3D texto = null;
             if (MostrarNumeros)
             {
                 if (fuente == null) fuente = ContentManager.Get<BitmapFont>("Fonts/Pericles");
                 texto = renderizador.FontBatch(
-                    fuente, 101, (VerATravesDeBloques ? DepthStencilState.None : DepthStencilState.DepthRead), RasterizerState.CullNone,
+                    fuente, 101, DepthStencilState.None, RasterizerState.CullNone,
                     BlendState.AlphaBlend, SamplerState.LinearClamp);
             }
 
@@ -132,6 +136,9 @@ namespace Game
                     string etiqueta = max > 0f
                         ? ((int)Math.Ceiling(v * max)).ToString() + "/" + ((int)Math.Round(max)).ToString()
                         : ((int)Math.Ceiling(v * 100f)).ToString() + "%";
+                    // nombre de la criatura delante de los numeros: "Vaca 15/25"
+                    string nombre = c.DisplayName;
+                    if (!string.IsNullOrEmpty(nombre)) etiqueta = nombre + "  " + etiqueta;
                     texto.QueueText(etiqueta, centro + arriba * (h + 0.05f),
                         derecha * TamanoTexto, -arriba * TamanoTexto, new Color((byte)255, (byte)255, (byte)255, alfa),
                         TextAnchor.HorizontalCenter | TextAnchor.Bottom);
