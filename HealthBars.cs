@@ -32,10 +32,20 @@ namespace Game
         readonly Dictionary<ComponentCreature, float> vidaPrevia = new Dictionary<ComponentCreature, float>();
         readonly Dictionary<ComponentCreature, double> ultimoGolpe = new Dictionary<ComponentCreature, double>();
         double proximaLimpieza;
+        SubsystemTime tiempoMundo;
+
+        // al dormir el juego acelera el tiempo: las criaturas se mueven a lo loco y las barras con ellas.
+        // Mientras el tiempo va acelerado se ocultan las barras y el panel.
+        bool Durmiendo()
+        {
+            return tiempoMundo != null && tiempoMundo.GameTimeFactor > 1.01f;
+        }
 
         public override void __ModInitialize()
         {
             ModsManager.RegisterHook("InitializeCreatureTypes", this);
+            ModsManager.RegisterHook("GuiDraw", this);
+            ModsManager.RegisterHook("AttackBody", this);
             // GuiDraw corre ANTES que el agua y esta tapa la barra; DrawToScreen corre cuando el
             // mundo (agua incluida) ya esta dibujado, asi que la barra queda encima de todo.
             ModsManager.RegisterHook("DrawToScreen", this);
@@ -47,11 +57,205 @@ namespace Game
             List<SubsystemCreatureSpawn.CreatureType> creatureTypes)
         {
             creaturas = subsystemCreatureSpawn;
+            tiempoMundo = subsystemCreatureSpawn.Project.FindSubsystem<SubsystemTime>(false);
             vidaPrevia.Clear();
+            paneles.Clear();
             ultimoGolpe.Clear();
         }
 
         static bool desactivado;
+
+        // ---- panel lateral del animal golpeado ----
+        const float SegundosPanel = 10f;    // el panel dura 10 s tras el ultimo golpe a ese animal
+        const float AnchoPanel = 200f;
+        const float AltoPanel = 76f;
+        const float AltoBarraPanel = 7f;    // grosor de la barrita fina
+
+        class Panel
+        {
+            public CanvasWidget Caja;
+            public LabelWidget Nombre;
+            public LabelWidget Vida;
+            public RectangleWidget Relleno;
+            public ComponentCreature Objetivo;
+            public double Fin;
+            public string UltimoTexto;
+        }
+
+        readonly Dictionary<ComponentGui, Panel> paneles = new Dictionary<ComponentGui, Panel>();
+        static bool panelDesactivado;
+        static System.Reflection.MemberInfo miembroObjetivo;
+        static bool miembroBuscado;
+        double ultimoAtaqueJugador = -100;
+        ComponentCreature jugadorAtacante;
+
+        // saca la criatura golpeada del Attackment (el campo "Target" cambia de tipo segun la version)
+        static ComponentCreature CriaturaDe(object ataque)
+        {
+            if (ataque == null) return null;
+            if (!miembroBuscado)
+            {
+                miembroBuscado = true;
+                System.Reflection.BindingFlags f = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance;
+                miembroObjetivo = (System.Reflection.MemberInfo)ataque.GetType().GetProperty("Target", f)
+                    ?? (System.Reflection.MemberInfo)ataque.GetType().GetField("Target", f);
+            }
+            object o = null;
+            System.Reflection.PropertyInfo p = miembroObjetivo as System.Reflection.PropertyInfo;
+            System.Reflection.FieldInfo fi = miembroObjetivo as System.Reflection.FieldInfo;
+            if (p != null) o = p.GetValue(ataque, null);
+            else if (fi != null) o = fi.GetValue(ataque);
+            return CriaturaDe(o as Component);
+        }
+
+        static ComponentCreature CriaturaDe(Component comp)
+        {
+            if (comp == null) return null;
+            ComponentCreature c = comp as ComponentCreature;
+            return c ?? comp.Entity.FindComponent<ComponentCreature>(false);
+        }
+
+        void RegistrarGolpe(ComponentCreature atacante, ComponentCreature objetivo)
+        {
+            if (panelDesactivado || atacante == null || objetivo == null) return;
+            if (!(atacante is ComponentPlayer) || objetivo is ComponentPlayer) return;
+            ComponentGui gui = atacante.Entity.FindComponent<ComponentGui>(false);
+            if (gui == null) return;
+            Panel p;
+            if (!paneles.TryGetValue(gui, out p))
+            {
+                p = new Panel();
+                paneles[gui] = p;
+            }
+            p.Objetivo = objetivo;
+            p.Fin = Time.RealTime + SegundosPanel;
+            p.UltimoTexto = null;
+        }
+
+        public override void GuiDraw(ComponentGui componentGui, Camera camera, int drawOrder)
+        {
+            if (panelDesactivado || componentGui == null) return;
+            try
+            {
+                Panel p;
+                if (!paneles.TryGetValue(componentGui, out p)) return;
+                ContainerWidget contenedor = componentGui.ControlsContainerWidget;
+                if (contenedor == null) return;
+
+                if (p.Caja == null)
+                {
+                    // al reaparecer el jugador el contenedor es el mismo: quita paneles viejos
+                    List<ComponentGui> viejos = new List<ComponentGui>();
+                    foreach (KeyValuePair<ComponentGui, Panel> par in paneles)
+                    {
+                        if (par.Key == componentGui || par.Value.Caja == null) continue;
+                        if (par.Value.Caja.ParentWidget == contenedor)
+                        {
+                            contenedor.RemoveChildren(par.Value.Caja);
+                            viejos.Add(par.Key);
+                        }
+                    }
+                    for (int i = 0; i < viejos.Count; i++) paneles.Remove(viejos[i]);
+
+                    p.Caja = new CanvasWidget();
+                    p.Caja.Size = new Vector2(AnchoPanel, AltoPanel);
+                    p.Caja.HorizontalAlignment = WidgetAlignment.Near;
+                    p.Caja.VerticalAlignment = WidgetAlignment.Center;
+                    p.Caja.Margin = new Vector2(8f, 0f);
+                    p.Caja.IsHitTestVisible = false;
+
+                    RectangleWidget fondo = new RectangleWidget();
+                    fondo.Size = new Vector2(AnchoPanel, AltoPanel);
+                    fondo.HorizontalAlignment = WidgetAlignment.Near;
+                    fondo.VerticalAlignment = WidgetAlignment.Near;
+                    fondo.FillColor = new Color((byte)0, (byte)0, (byte)0, (byte)150);
+                    fondo.OutlineColor = new Color((byte)255, (byte)255, (byte)255, (byte)90);
+                    fondo.OutlineThickness = 1f;
+                    p.Caja.AddChildren(fondo);
+
+                    StackPanelWidget col = new StackPanelWidget();
+                    col.Direction = LayoutDirection.Vertical;
+                    col.HorizontalAlignment = WidgetAlignment.Center;
+                    col.VerticalAlignment = WidgetAlignment.Near;
+                    col.Margin = new Vector2(0f, 6f);
+                    p.Nombre = new LabelWidget();
+                    p.Nombre.FontScale = 1.0f;
+                    p.Nombre.Color = Color.White;
+                    p.Nombre.HorizontalAlignment = WidgetAlignment.Center;
+                    p.Vida = new LabelWidget();
+                    p.Vida.FontScale = 1.0f;
+                    p.Vida.HorizontalAlignment = WidgetAlignment.Center;
+                    col.AddChildren(p.Nombre);
+                    col.AddChildren(p.Vida);
+                    p.Caja.AddChildren(col);
+
+                    // barrita fina abajo: fondo oscuro + relleno que cambia de ancho y color
+                    float anchoBarra = AnchoPanel - 16f;
+                    RectangleWidget fondoBarra = new RectangleWidget();
+                    fondoBarra.Size = new Vector2(anchoBarra, AltoBarraPanel);
+                    fondoBarra.HorizontalAlignment = WidgetAlignment.Near;
+                    fondoBarra.VerticalAlignment = WidgetAlignment.Near;
+                    fondoBarra.Margin = new Vector2(8f, AltoPanel - AltoBarraPanel - 8f);
+                    fondoBarra.FillColor = new Color((byte)40, (byte)40, (byte)40, (byte)200);
+                    fondoBarra.OutlineColor = Color.Transparent;
+                    p.Caja.AddChildren(fondoBarra);
+                    p.Relleno = new RectangleWidget();
+                    p.Relleno.Size = new Vector2(anchoBarra, AltoBarraPanel);
+                    p.Relleno.HorizontalAlignment = WidgetAlignment.Near;
+                    p.Relleno.VerticalAlignment = WidgetAlignment.Near;
+                    p.Relleno.Margin = new Vector2(8f, AltoPanel - AltoBarraPanel - 8f);
+                    p.Relleno.OutlineColor = Color.Transparent;
+                    p.Caja.AddChildren(p.Relleno);
+                    contenedor.AddChildren(p.Caja);
+                }
+
+                ComponentCreature c = p.Objetivo;
+                bool visible = c != null && c.ComponentHealth != null && c.ComponentHealth.Health > 0f
+                    && Time.RealTime < p.Fin && !Durmiendo();
+                p.Caja.IsVisible = visible;
+                if (!visible) return;
+
+                float v = MathUtils.Clamp(c.ComponentHealth.Health, 0f, 1f);
+                float max = c.ComponentHealth.AttackResilience;
+                string vidaTxt = max > 0f
+                    ? (v * max).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " / " + max.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)
+                    : (v * 100f).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "%";
+                if (vidaTxt != p.UltimoTexto)
+                {
+                    p.UltimoTexto = vidaTxt;
+                    string nombre = c.DisplayName;
+                    p.Nombre.Text = string.IsNullOrEmpty(nombre) ? "?" : nombre;
+                    p.Vida.Text = vidaTxt;
+                    Color colorVida = ColorVida(v, (byte)255);
+                    p.Vida.Color = colorVida;
+                    p.Relleno.Size = new Vector2(MathUtils.Max((AnchoPanel - 16f) * v, 1f), AltoBarraPanel);
+                    p.Relleno.FillColor = colorVida;
+                }
+            }
+            catch (Exception ex)
+            {
+                panelDesactivado = true;
+                Log.Warning("Panel de vida desactivado por error: " + ex);
+            }
+        }
+
+        // el golpe del jugador a una criatura abre/renueva el panel lateral
+        public override bool AttackBody(ComponentBody target, ComponentCreature attacker,
+            Vector3 hitPoint, Vector3 hitDirection, ref float attackPower, bool isMeleeAttack)
+        {
+            try
+            {
+                if (attacker is ComponentPlayer) { jugadorAtacante = attacker; ultimoAtaqueJugador = Time.RealTime; }
+                RegistrarGolpe(attacker, CriaturaDe(target));
+            }
+            catch (Exception ex)
+            {
+                panelDesactivado = true;
+                Log.Warning("Panel de vida desactivado por error: " + ex);
+            }
+            return false;
+        }
+
 
         public override void DrawToScreen(ViewWidget viewWidget, Widget.DrawContext dc)
         {
@@ -72,6 +276,7 @@ namespace Game
 
         void Dibujar(Camera camera)
         {
+            if (Durmiendo()) return;
 
             Matrix vista = camera.ViewMatrix;
             Vector3 derecha = new Vector3(vista.M11, vista.M21, vista.M31);
@@ -110,7 +315,12 @@ namespace Game
                 if (!MostrarAlJugador && c.Entity.FindComponent<ComponentPlayer>(false) != null) continue;
 
                 float anterior;
-                if (vidaPrevia.TryGetValue(c, out anterior) && vida < anterior - 0.0001f) ultimoGolpe[c] = ahora;
+                if (vidaPrevia.TryGetValue(c, out anterior) && vida < anterior - 0.0001f)
+                {
+                    ultimoGolpe[c] = ahora;
+                    if (ahora - ultimoAtaqueJugador < 1.0 && jugadorAtacante != null && !(c is ComponentPlayer))
+                        RegistrarGolpe(jugadorAtacante, c);
+                }
                 vidaPrevia[c] = vida;
                 double golpe;
                 bool recienGolpeada = ultimoGolpe.TryGetValue(c, out golpe) && ahora - golpe < SegundosOpaca;
