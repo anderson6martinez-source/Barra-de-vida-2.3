@@ -386,7 +386,7 @@ namespace Game
     {
         // ---- ajustes ----
         const float Multiplicador = 1.7f;          // velocidad al correr (1.7 = 70% mas rapido)
-        const float MultiplicadorStamina = 1.7f;   // gasto de stamina al correr (1.7 = 70% mas)
+        const float GastoCorrerPorSegundo = 0.05f; // stamina extra que gasta correr por segundo mientras te mueves (0.05 = 5%)
         const string TextoApagado = "Correr";
         const string TextoEncendido = "Correr: ON";
         const bool MostrarBarraStamina = true;
@@ -480,7 +480,7 @@ namespace Game
                     ? 0.008f * caminar
                     : (0.07f + 0.006f * k) * caminar;
 
-                vital.Stamina -= (MultiplicadorStamina - 1f) * movimiento * dt;
+                vital.Stamina -= GastoCorrerPorSegundo * dt;
             }
             catch (Exception ex)
             {
